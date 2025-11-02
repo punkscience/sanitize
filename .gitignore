@@ -5,8 +5,8 @@
 *.so
 *.dylib
 
-# AI files
-.github/
+# AI files - track copilot rules but ignore other generated files
+.github/workflows/generated/
 
 # Test binary, built with `go test -c`
 *.test

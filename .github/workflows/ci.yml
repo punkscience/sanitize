@@ -1,0 +1,304 @@
+# GitHub Actions CI/CD Pipeline for Sanitize
+# This workflow runs automated tests, builds the application, and performs quality checks
+# following the rules defined in .github/copilot/rules.md
+
+name: CI/CD Pipeline
+
+# Trigger the workflow on push to main branch and pull requests
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# Define environment variables
+env:
+  GO_VERSION: '1.24'
+
+# Jobs definition
+jobs:
+  # Test job - runs unit tests and generates coverage reports
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Checkout the repository code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Set up Go environment with specified version
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    # Cache Go modules to speed up subsequent builds
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    # Download and verify dependencies
+    - name: Download dependencies
+      run: go mod download
+
+    # Verify dependencies and check for vulnerabilities
+    - name: Verify dependencies
+      run: go mod verify
+
+    # Run unit tests with coverage
+    - name: Run tests
+      run: go test -v -race -coverprofile=coverage.out ./...
+
+    # Generate coverage report
+    - name: Generate coverage report
+      run: go tool cover -html=coverage.out -o coverage.html
+
+    # Upload coverage to Codecov (optional - requires CODECOV_TOKEN secret)
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./coverage.out
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false # Don't fail CI if codecov upload fails
+
+    # Upload coverage artifacts
+    - name: Upload coverage artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: coverage-report
+        path: |
+          coverage.out
+          coverage.html
+
+  # Lint job - runs code quality checks
+  lint:
+    name: Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+    # Checkout the repository code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Set up Go environment
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    # Run golangci-lint for comprehensive code analysis
+    - name: Run golangci-lint
+      uses: golangci/golangci-lint-action@v3
+      with:
+        version: latest
+        args: --timeout=5m
+
+    # Run go vet for additional static analysis
+    - name: Run go vet
+      run: go vet ./...
+
+    # Check code formatting
+    - name: Check formatting
+      run: |
+        if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+          echo "The following files are not properly formatted:"
+          gofmt -s -l .
+          exit 1
+        fi
+
+    # Run staticcheck for additional static analysis
+    - name: Run staticcheck
+      uses: dominikh/staticcheck-action@v1.3.0
+      with:
+        version: "2023.1.7"
+
+    # Check for security vulnerabilities
+    - name: Run gosec security scanner
+      uses: securecodewarrior/github-action-gosec@master
+      with:
+        args: '-fmt sarif -out gosec.sarif ./...'
+
+    # Upload security scan results
+    - name: Upload SARIF file
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: gosec.sarif
+
+  # Build job - builds the application for multiple platforms
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [test, lint] # Only run if tests and linting pass
+    
+    strategy:
+      matrix:
+        goos: [linux, windows, darwin]
+        goarch: [amd64, arm64]
+        exclude:
+          # Exclude combinations that are not commonly used
+          - goos: windows
+            goarch: arm64
+
+    steps:
+    # Checkout the repository code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Set up Go environment
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    # Cache Go modules
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+
+    # Download dependencies
+    - name: Download dependencies
+      run: go mod download
+
+    # Build the application
+    - name: Build application
+      env:
+        GOOS: ${{ matrix.goos }}
+        GOARCH: ${{ matrix.goarch }}
+      run: |
+        # Set the binary name based on OS
+        BINARY_NAME="sanitize"
+        if [ "$GOOS" = "windows" ]; then
+          BINARY_NAME="sanitize.exe"
+        fi
+        
+        # Build with appropriate flags
+        go build -ldflags="-s -w -X main.version=${{ github.sha }}" -o "build/${BINARY_NAME}-${GOOS}-${GOARCH}" .
+
+    # Upload build artifacts
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: sanitize-${{ matrix.goos }}-${{ matrix.goarch }}
+        path: build/sanitize*
+
+  # Release job - creates releases for tagged commits
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/v') # Only run on version tags
+    
+    steps:
+    # Checkout the repository code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Download all build artifacts
+    - name: Download artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts/
+
+    # Create release
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref_name }}
+        release_name: Release ${{ github.ref_name }}
+        body: |
+          ## Changes in this Release
+          - Automated release from CI/CD pipeline
+          - Cross-platform binaries included
+          
+          ## Installation
+          Download the appropriate binary for your platform from the assets below.
+          
+          ## Usage
+          ```bash
+          ./sanitize --help
+          ```
+        draft: false
+        prerelease: false
+
+    # Upload release assets
+    - name: Upload Release Assets
+      uses: softprops/action-gh-release@v1
+      with:
+        files: artifacts/*/sanitize*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Integration test job - runs more comprehensive tests
+  integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: [build]
+    
+    steps:
+    # Checkout the repository code
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # Set up Go environment
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    # Download dependencies
+    - name: Download dependencies
+      run: go mod download
+
+    # Build the application
+    - name: Build application
+      run: go build -o sanitize .
+
+    # Create test directory structure
+    - name: Create test directory structure
+      run: |
+        mkdir -p test_integration/folder1/subfolder
+        mkdir -p "test_integration/bad<chars>/deep"
+        mkdir -p "test_integration/unicode_café"
+        touch "test_integration/folder1/file.txt"
+
+    # Test dry run mode
+    - name: Test dry run mode
+      run: |
+        ./sanitize --path test_integration --dry-run --verbose
+
+    # Test actual sanitization
+    - name: Test actual sanitization
+      run: |
+        ./sanitize --path test_integration --verbose
+
+    # Verify results
+    - name: Verify sanitization results
+      run: |
+        # Check that problematic directories were renamed
+        if [ -d "test_integration/bad_chars_" ] || [ -d "test_integration/unicode_cafe" ]; then
+          echo "Sanitization successful"
+        else
+          echo "Sanitization may have failed"
+          ls -la test_integration/
+          exit 1
+        fi
+
+    # Cleanup
+    - name: Cleanup test directories
+      run: rm -rf test_integration/
